@@ -34,7 +34,7 @@ var credential = new DefaultAzureCredential();
 builder.Services.AddSingleton<TokenCredential>(credential);
 var redisOptions = await EntraAuthentication.CreateRedisOptionsAsync(redisConnectionString, credential);
 
-builder.AddTelemetry();
+builder.AddTelemetry(credential);
 
 builder.Services.AddDbContext<WorkerDbContext>(options =>
     options.UseNpgsql(postgresConnectionString, npgsqlOptions => npgsqlOptions

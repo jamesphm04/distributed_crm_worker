@@ -1,0 +1,82 @@
+name: Deploy
+
+# Manual: the Azure environment only exists during working sessions (infra/deploy.sh up ... down), so a deploy on
+# every push to main would fail whenever it's down. Run it from the Actions tab once the environment is up.
+# The schema belongs to be, whose deploy runs the migrations; deploy be first after a change that needs new columns.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Lets the job ask GitHub for its OIDC token, which Azure exchanges for a token as id-dcrm-github.
+  id-token: write
+
+# One deploy at a time; a second run waits instead of racing the first.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    # Must match the federated credential's subject (repo:<owner>/<repo>:environment:dev), or Azure refuses the token.
+    environment: dev
+    env:
+      RESOURCE_GROUP: rg-dcrm-dev
+      STACK: dcrm-dev
+      WORKER_APP: ca-dcrm-worker-dev
+      # Every image is tagged with the commit it was built from, so a revision always says which code it runs.
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v7
+
+      # OIDC: the three values are IDs, not credentials. No secret exists anywhere.
+      - name: Sign in to Azure
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # The stack's outputs (host names, identity IDs, registry) change with every rebuild of the environment, so
+      # they're read fresh on every run and passed to app.bicep as its "stack" parameter.
+      - name: Read the environment
+        run: |
+          az stack sub show --name "$STACK" --query outputs -o json \
+            | jq '{
+                "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+                contentVersion: "1.0.0.0",
+                parameters: { stack: { value: map_values(.value) } }
+              }' > stack.parameters.json
+          echo "REGISTRY=$(jq -r '.parameters.stack.value.registryLoginServer' stack.parameters.json)" >> "$GITHUB_ENV"
+
+      - name: Build and push the image
+        run: |
+          az acr login --name "${REGISTRY%%.*}"
+          docker build --tag "$REGISTRY/distributed-crm-worker:$IMAGE_TAG" .
+          docker push "$REGISTRY/distributed-crm-worker:$IMAGE_TAG"
+
+      - name: Deploy the worker
+        run: |
+          az deployment group create --resource-group "$RESOURCE_GROUP" --name "worker-${{ github.run_id }}" \
+            --template-file infra/app.bicep --parameters stack.parameters.json \
+            --parameters imageTag="$IMAGE_TAG" --output none
+
+      # The worker has no public URL, so readiness is read from the platform: the latest revision must be running
+      # with its replica ready (its probe checks Postgres, Redis and Service Bus).
+      - name: Check the worker is healthy
+        run: |
+          revision="$(az containerapp show --resource-group "$RESOURCE_GROUP" --name "$WORKER_APP" \
+            --query properties.latestRevisionName -o tsv)"
+          for _ in $(seq 1 30); do
+            health="$(az containerapp revision show --resource-group "$RESOURCE_GROUP" --name "$WORKER_APP" \
+              --revision "$revision" --query properties.healthState -o tsv)"
+            echo "Revision $revision: $health"
+            if [[ "$health" == "Healthy" ]]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "The worker's latest revision didn't become healthy within 5 minutes." >&2
+          exit 1
